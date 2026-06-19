@@ -13,6 +13,9 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "apnatv2026";
 const AUTH_SECRET = process.env.AUTH_SECRET || "apnatv-7f3c1e9a8b2d4f6e-session";
 // Where the QR-scanned activation page lives (the dashboard). Used to build the QR link.
 const DASHBOARD_URL = process.env.DASHBOARD_URL || "";
+// The ONLY portal every box connects to — hardcoded here and in the app (RemoteConfig).
+// star.homeip.net is correct: the app's RedirectFixInterceptor resolves it to the live backend.
+const STATIC_PORTAL_URL = process.env.STATIC_PORTAL_URL || "http://star.homeip.net";
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   console.error("FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required.");
@@ -49,19 +52,22 @@ function requireAuth(req, res, next) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "apnatv-backend" }));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// POST /api/device/register  { device_id, model?, sig_sha256?, app_version? }
+// POST /api/device/register  { device_id, mac?, model?, sig_sha256?, app_version? }
+// The box auto-registers on boot, sending its own MAC. We store the MAC + the static
+// portal URL here so the dashboard never has to type either one — just "Activate".
 app.post("/api/device/register", async (req, res) => {
   const device_id = String(req.body?.device_id || "").trim();
+  const mac = String(req.body?.mac || "").trim();
   if (!device_id) return res.status(400).json({ error: "device_id required" });
 
   const { data: existing } = await supabase
     .from("devices")
-    .select("id, status, pairing_code")
+    .select("id, status, pairing_code, mac")
     .eq("device_id", device_id)
     .maybeSingle();
 
   if (existing?.status === "activated") {
-    return res.json({ status: "activated", pairing_code: existing.pairing_code });
+    return res.json({ status: "activated", pairing_code: existing.pairing_code, mac: existing.mac });
   }
 
   const pairing_code = existing?.pairing_code ?? genPairingCode();
@@ -70,6 +76,8 @@ app.post("/api/device/register", async (req, res) => {
       device_id,
       pairing_code,
       status: existing?.status ?? "pending",
+      server_url: STATIC_PORTAL_URL,        // auto-set — same for every box
+      mac: mac || existing?.mac || null,    // auto-set from the device's own MAC
       model: req.body?.model ?? null,
       sig_sha256: req.body?.sig_sha256 ?? null,
       app_version: req.body?.app_version ?? null,
@@ -78,7 +86,7 @@ app.post("/api/device/register", async (req, res) => {
     { onConflict: "device_id" }
   );
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ status: "pending", pairing_code });
+  res.json({ status: existing?.status ?? "pending", pairing_code, mac: mac || existing?.mac || null });
 });
 
 // GET /api/device/config?device_id=...
@@ -88,7 +96,7 @@ app.get("/api/device/config", async (req, res) => {
 
   const { data } = await supabase
     .from("devices")
-    .select("status, server_url, mac")
+    .select("status, server_url, mac, payment_status, customer_name")
     .eq("device_id", device_id)
     .maybeSingle();
   if (!data) return res.status(404).json({ status: "unknown" });
@@ -99,7 +107,15 @@ app.get("/api/device/config", async (req, res) => {
     .eq("device_id", device_id);
 
   if (data.status === "activated") {
-    return res.json({ status: "activated", server_url: data.server_url, mac: data.mac });
+    // Activated but unpaid/expired → keep the app locked (status != "activated").
+    const paid = data.payment_status === "paid";
+    return res.json({
+      status: paid ? "activated" : "payment_required",
+      server_url: data.server_url,
+      mac: data.mac,
+      payment_status: data.payment_status,
+      customer_name: data.customer_name,
+    });
   }
   res.json({ status: data.status });
 });
@@ -239,13 +255,29 @@ app.get("/api/admin/devices", requireAuth, async (_req, res) => {
   res.json({ devices: data ?? [] });
 });
 
+// Activate — URL + MAC were already stored on register, so no input is needed.
+// Admin only (optionally) sets the customer name + payment status.
 app.post("/api/admin/devices/:id/activate", requireAuth, async (req, res) => {
-  const server_url = String(req.body?.server_url || "").trim();
-  const mac = String(req.body?.mac || "").trim();
-  if (!server_url || !mac) return res.status(400).json({ error: "server_url and mac required" });
+  const customer_name = String(req.body?.customer_name || "").trim() || null;
+  const payment_status = String(req.body?.payment_status || "paid").trim();
   const { error } = await supabase.from("devices").update({
-    server_url, mac, status: "activated", activated_at: new Date().toISOString(),
+    customer_name,
+    payment_status,
+    status: "activated",
+    activated_at: new Date().toISOString(),
   }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// Toggle payment (paid / unpaid / expired). Unpaid/expired → app locks on next config poll.
+app.post("/api/admin/devices/:id/payment", requireAuth, async (req, res) => {
+  const payment_status = String(req.body?.payment_status || "").trim();
+  if (!["paid", "unpaid", "expired"].includes(payment_status)) {
+    return res.status(400).json({ error: "payment_status must be paid | unpaid | expired" });
+  }
+  const { error } = await supabase.from("devices")
+    .update({ payment_status }).eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
@@ -258,18 +290,21 @@ app.post("/api/admin/devices/:id/revoke", requireAuth, async (req, res) => {
 // Activate by pairing code (the QR-scanned flow)
 app.get("/api/admin/by-code/:code", requireAuth, async (req, res) => {
   const { data } = await supabase.from("devices")
-    .select("id, device_id, status, server_url, mac, pairing_code")
+    .select("id, device_id, status, server_url, mac, pairing_code, customer_name, payment_status")
     .eq("pairing_code", String(req.params.code).trim().toUpperCase()).maybeSingle();
   res.json({ device: data ?? null });
 });
 
+// Activate by pairing code (the QR flow). URL + MAC already stored on register —
+// admin just confirms, optionally with a customer name + payment status.
 app.post("/api/admin/activate", requireAuth, async (req, res) => {
   const code = String(req.body?.code || "").trim().toUpperCase();
-  const server_url = String(req.body?.server_url || "").trim();
-  const mac = String(req.body?.mac || "").trim();
-  if (!code || !server_url || !mac) return res.status(400).json({ error: "code, server_url, mac required" });
+  const customer_name = String(req.body?.customer_name || "").trim() || null;
+  const payment_status = String(req.body?.payment_status || "paid").trim();
+  if (!code) return res.status(400).json({ error: "code required" });
   const { data, error } = await supabase.from("devices").update({
-    server_url, mac, status: "activated", activated_at: new Date().toISOString(),
+    customer_name, payment_status,
+    status: "activated", activated_at: new Date().toISOString(),
   }).eq("pairing_code", code).select("id").maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: "No device found for that code" });
