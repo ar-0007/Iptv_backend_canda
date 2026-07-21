@@ -70,23 +70,31 @@ app.post("/api/device/register", async (req, res) => {
     return res.json({ status: "activated", pairing_code: existing.pairing_code, mac: existing.mac });
   }
 
+  // Self-managed: the box is on a RESELLER's OWN portal (a non-star server_url it sent). Such a box
+  // is NOT under our activation/payment/revoke control — we just RECORD it so the dashboard can SHOW
+  // it. Only the default star.homeip.net portal goes through the pairing-code activation flow.
+  const norm = (s) => String(s || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  const server_url_in = String(req.body?.server_url || "").trim();
+  const isSelfManaged = server_url_in && norm(server_url_in) !== norm(STATIC_PORTAL_URL);
+
   const pairing_code = existing?.pairing_code ?? genPairingCode();
-  const { error } = await supabase.from("devices").upsert(
-    {
-      device_id,
-      pairing_code,
-      status: existing?.status ?? "pending",
-      server_url: STATIC_PORTAL_URL,        // auto-set — same for every box
-      mac: mac || existing?.mac || null,    // auto-set from the device's own MAC
-      model: req.body?.model ?? null,
-      sig_sha256: req.body?.sig_sha256 ?? null,
-      app_version: req.body?.app_version ?? null,
-      last_seen: new Date().toISOString(),
-    },
-    { onConflict: "device_id" }
-  );
+  const row = {
+    device_id,
+    pairing_code,
+    status: isSelfManaged ? "self_managed" : (existing?.status ?? "pending"),
+    server_url: isSelfManaged ? server_url_in : STATIC_PORTAL_URL,
+    mac: mac || existing?.mac || null,    // auto-set from the device's own MAC
+    model: req.body?.model ?? null,
+    sig_sha256: req.body?.sig_sha256 ?? null,
+    app_version: req.body?.app_version ?? null,
+    last_seen: new Date().toISOString(),
+  };
+  // A self-managed box is never "unpaid" in our system — mark it paid so nothing ever locks it.
+  if (isSelfManaged) row.payment_status = "paid";
+
+  const { error } = await supabase.from("devices").upsert(row, { onConflict: "device_id" });
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ status: existing?.status ?? "pending", pairing_code, mac: mac || existing?.mac || null });
+  res.json({ status: row.status, pairing_code, mac: row.mac });
 });
 
 // GET /api/device/config?device_id=...
@@ -157,6 +165,100 @@ app.get("/api/qr", async (req, res) => {
   res.setHeader("Content-Type", "image/png");
   res.setHeader("Cache-Control", "no-store");
   res.send(png);
+});
+
+// ============================================================
+// UNIVERSAL QR-PAIRING (setup screen) — NO activation/payment gate.
+// The box shows a QR that opens /setup/<CODE> in the provider's browser; the provider types the
+// portal URL there; the box polls /api/setup/<CODE> and auto-connects. In-memory store (TTL 15m) —
+// the box polls every few seconds during pairing, which keeps the dyno awake, so no DB is needed.
+// ============================================================
+const setupPairings = new Map(); // CODE -> { server_url, at }
+const SETUP_TTL_MS = 15 * 60 * 1000;
+function cleanupPairings() {
+  const now = Date.now();
+  for (const [k, v] of setupPairings) if (now - v.at > SETUP_TTL_MS) setupPairings.delete(k);
+}
+
+// The box polls this; returns the portal URL once the provider has submitted it.
+app.get("/api/setup/:code", (req, res) => {
+  cleanupPairings();
+  const code = String(req.params.code || "").trim().toUpperCase();
+  const entry = setupPairings.get(code);
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ server_url: entry?.server_url || null });
+});
+
+// The provider's browser posts the portal URL here (via the /setup page's form).
+app.post("/api/setup/:code", (req, res) => {
+  const code = String(req.params.code || "").trim().toUpperCase();
+  let url = String(req.body?.server_url || "").trim();
+  if (!code) return res.status(400).json({ error: "code required" });
+  if (!url) return res.status(400).json({ error: "server_url required" });
+  if (!/^https?:\/\//i.test(url)) url = "http://" + url; // tolerate a bare host
+  setupPairings.set(code, { server_url: url, at: Date.now() });
+  res.json({ ok: true });
+});
+
+// The page the provider opens from the QR — a simple mobile-friendly form.
+app.get("/setup/:code", (req, res) => {
+  const code = String(req.params.code || "").trim().toUpperCase();
+  const mac = String(req.query.mac || "").trim();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Easy TV — Connect your portal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#160D06; color:#F3EAD8;
+         display:flex; min-height:100vh; align-items:center; justify-content:center; padding:20px; }
+  .card { width:100%; max-width:440px; background:#241610; border:1px solid rgba(200,154,110,.35);
+          border-radius:16px; padding:26px; }
+  h1 { margin:0 0 4px; font-size:22px; color:#C89A6E; }
+  p.sub { margin:0 0 18px; color:#B49A80; font-size:14px; }
+  .meta { font-size:13px; color:#B49A80; margin:10px 0; }
+  .meta b { color:#F3EAD8; letter-spacing:1px; }
+  label { display:block; font-size:13px; color:#B49A80; margin:16px 0 6px; }
+  input { width:100%; padding:14px; font-size:16px; border-radius:10px; border:1px solid rgba(200,154,110,.4);
+          background:#160D06; color:#F3EAD8; }
+  input:focus { outline:none; border-color:#C89A6E; }
+  button { width:100%; margin-top:18px; padding:14px; font-size:16px; font-weight:700; border:0;
+           border-radius:10px; background:#C89A6E; color:#160D06; cursor:pointer; }
+  button:disabled { opacity:.6; }
+  .msg { margin-top:16px; font-size:14px; text-align:center; min-height:20px; }
+  .ok { color:#5FBF8F; } .err { color:#D9776A; }
+</style></head><body>
+  <div class="card">
+    <h1>Connect your portal</h1>
+    <p class="sub">Enter the IPTV portal URL for this box. It will connect automatically.</p>
+    <div class="meta">Pairing code: <b>${code}</b></div>
+    ${mac ? `<div class="meta">Box MAC: <b>${mac}</b> — whitelist this on your panel.</div>` : ``}
+    <label for="url">Portal URL</label>
+    <input id="url" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
+           placeholder="http://your-portal.com/c/">
+    <button id="go" onclick="submitUrl()">Connect this box</button>
+    <div id="msg" class="msg"></div>
+  </div>
+<script>
+  var CODE = ${JSON.stringify(code)};
+  async function submitUrl() {
+    var url = document.getElementById('url').value.trim();
+    var msg = document.getElementById('msg');
+    var btn = document.getElementById('go');
+    if (!url) { msg.className='msg err'; msg.textContent='Please enter a portal URL.'; return; }
+    btn.disabled = true; msg.className='msg'; msg.textContent='Sending…';
+    try {
+      var r = await fetch('/api/setup/' + encodeURIComponent(CODE), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ server_url: url })
+      });
+      if (r.ok) { msg.className='msg ok'; msg.textContent='✓ Sent! The box will connect in a few seconds.'; }
+      else { msg.className='msg err'; msg.textContent='Something went wrong. Try again.'; btn.disabled=false; }
+    } catch (e) { msg.className='msg err'; msg.textContent='Network error. Try again.'; btn.disabled=false; }
+  }
+</script>
+</body></html>`);
 });
 
 // ============================================================
