@@ -1,4 +1,4 @@
-# Apna TV — Backend (Express API)
+# 10K Ultra — Backend (Express API)
 
 Standalone API server for OTA updates, QR device activation and the dashboard.
 Deploys on **Render** (Node web service, always-on).
@@ -16,7 +16,7 @@ npm start              # http://localhost:4000
 2. Build command: `npm install` · Start command: `npm start`
 3. Add Environment variables: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
    `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `AUTH_SECRET`, (optional) `DASHBOARD_URL`.
-4. Deploy → you get `https://apnatv-backend.onrender.com`.
+4. Deploy → you get `https://tenkultra-backend.onrender.com`.
 
 ## Endpoints
 App-facing: `POST /api/device/register`, `GET /api/device/config`,
