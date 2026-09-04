@@ -1,7 +1,7 @@
 {
-  "name": "tenkultra-backend",
+  "name": "apnatv-backend",
   "version": "1.0.0",
-  "description": "10K Ultra backend API — OTA updates, QR device activation, licensing",
+  "description": "Apna TV backend API — OTA updates, QR device activation, licensing",
   "type": "module",
   "main": "server.js",
   "scripts": {
