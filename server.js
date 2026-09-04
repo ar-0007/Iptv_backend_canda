@@ -21,8 +21,12 @@ const IS_PROD = (process.env.NODE_ENV || "").toLowerCase() === "production";
 const SESSION_HOURS = Number(process.env.SESSION_HOURS || 12);
 
 // Browser origins allowed to call the admin API. Comma-separated; empty = allow any (dev only).
+// Normalized (trailing slash + case) so a copy-pasted env var with `.../` still matches the bare
+// origin a browser actually sends — a mismatch here fails every request with a bare "Failed to
+// fetch" in the browser, no server-side error to point at.
+const normOrigin = (o) => String(o || "").trim().toLowerCase().replace(/\/+$/, "");
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",").map((o) => o.trim()).filter(Boolean);
+  .split(",").map(normOrigin).filter(Boolean);
 // Where the QR-scanned activation page lives (the dashboard). Used to build the QR link.
 const DASHBOARD_URL = process.env.DASHBOARD_URL || "";
 // The ONLY managed portal every box connects to by default — hardcoded here and in the app
@@ -57,7 +61,7 @@ const app = express();
 app.use(cors({
   origin(origin, cb) {
     if (!origin || ALLOWED_ORIGINS.length === 0) return cb(null, true);
-    cb(null, ALLOWED_ORIGINS.includes(origin));
+    cb(null, ALLOWED_ORIGINS.includes(normOrigin(origin)));
   },
 }));
 app.use(express.json());
