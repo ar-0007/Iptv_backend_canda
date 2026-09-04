@@ -3,22 +3,48 @@ import express from "express";
 import cors from "cors";
 import QRCode from "qrcode";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "node:crypto";
 
 // ---------- config ----------
 const PORT = process.env.PORT || 4000;
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@apnatv.com";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "apnatv2026";
-const AUTH_SECRET = process.env.AUTH_SECRET || "apnatv-7f3c1e9a8b2d4f6e-session";
+// First-run bootstrap admin. Used ONCE, to seed the resellers table on an empty database; after
+// that every sign-in is checked against that table. Not a standing back door.
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "admin@apnatv.com").trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+
+// Signs dashboard session tokens. There is deliberately NO default: a shipped fallback secret is a
+// master key to every reseller account, so the server refuses to start in production without one.
+const AUTH_SECRET = process.env.AUTH_SECRET || "";
+const IS_PROD = (process.env.NODE_ENV || "").toLowerCase() === "production";
+const SESSION_HOURS = Number(process.env.SESSION_HOURS || 12);
+
+// Browser origins allowed to call the admin API. Comma-separated; empty = allow any (dev only).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map((o) => o.trim()).filter(Boolean);
 // Where the QR-scanned activation page lives (the dashboard). Used to build the QR link.
 const DASHBOARD_URL = process.env.DASHBOARD_URL || "";
-// The ONLY portal every box connects to — hardcoded here and in the app (RemoteConfig).
-// star.homeip.net is correct: the app's RedirectFixInterceptor resolves it to the live backend.
+// The ONLY managed portal every box connects to by default — hardcoded here and in the app
+// (RemoteConfig). star.homeip.net is correct: the app's RedirectFixInterceptor resolves it to the
+// live backend. A box can instead report its OWN portal — see isSelfManaged below.
 const STATIC_PORTAL_URL = process.env.STATIC_PORTAL_URL || "http://star.homeip.net";
+const RESELLERS_TABLE = "resellers";
 
+// Fail fast rather than boot into an insecure state that looks fine until it is exploited.
+const fatal = [];
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-  console.error("FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required.");
+  fatal.push("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
+}
+if (!AUTH_SECRET || AUTH_SECRET.length < 32) {
+  fatal.push("AUTH_SECRET is required and must be at least 32 characters (it signs every session).");
+}
+if (IS_PROD && ALLOWED_ORIGINS.length === 0) {
+  fatal.push("ALLOWED_ORIGINS is required in production (the dashboard origin, comma-separated).");
+}
+if (fatal.length) {
+  console.error("FATAL:\n  - " + fatal.join("\n  - "));
+  process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
@@ -26,7 +52,14 @@ const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 });
 
 const app = express();
-app.use(cors()); // allow the dashboard (Netlify) + app to call us
+// The app (no Origin header) always passes; browsers are held to the allowlist so a random site
+// cannot drive the admin API with a signed-in reseller's browser.
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.length === 0) return cb(null, true);
+    cb(null, ALLOWED_ORIGINS.includes(origin));
+  },
+}));
 app.use(express.json());
 
 // ---------- helpers ----------
@@ -37,11 +70,140 @@ function genPairingCode(len = 6) {
   return out;
 }
 
-// Admin auth: the dashboard logs in and sends `Authorization: Bearer <AUTH_SECRET>`.
+// ============================================================
+// AUTH — real accounts, signed sessions, per-reseller isolation
+// ============================================================
+//
+// The old build handed every caller the same static secret as its "token", so anyone who signed in
+// was the same omniscient admin and saw every reseller's devices. Now:
+//   * passwords are scrypt hashes (node built-in; no extra dependency to keep patched),
+//   * a session is an HMAC-signed token carrying WHO you are and when it expires,
+//   * every admin query is scoped to the caller's reseller id unless they are an admin.
+
+const b64u = (buf) => Buffer.from(buf).toString("base64url");
+
+/** scrypt$<salt>$<hash> — salt is per user, so identical passwords never share a hash. */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(password), salt, 64);
+  return `scrypt$${salt.toString("base64url")}$${hash.toString("base64url")}`;
+}
+
+function verifyPassword(password, stored) {
+  const parts = String(stored || "").split("$");
+  if (parts.length !== 3 || parts[0] !== "scrypt") return false;
+  const salt = Buffer.from(parts[1], "base64url");
+  const expected = Buffer.from(parts[2], "base64url");
+  const actual = crypto.scryptSync(String(password), salt, expected.length);
+  // Constant-time: a length-dependent early return leaks how much of the hash matched.
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function signToken(payload) {
+  const body = b64u(JSON.stringify(payload));
+  const sig = crypto.createHmac("sha256", AUTH_SECRET).update(body).digest("base64url");
+  return `${body}.${sig}`;
+}
+
+function verifyToken(token) {
+  const [body, sig] = String(token || "").split(".");
+  if (!body || !sig) return null;
+  const expected = crypto.createHmac("sha256", AUTH_SECRET).update(body).digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  const payload = JSON.parse(Buffer.from(body, "base64url").toString());
+  if (!payload?.exp || payload.exp < Date.now()) return null;   // expired
+  return payload;
+}
+
+/** Rejects anyone without a valid, unexpired session; attaches it as req.user. */
 function requireAuth(req, res, next) {
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (token !== AUTH_SECRET) return res.status(401).json({ error: "unauthorized" });
+  const user = verifyToken((req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  req.user = user;
   next();
+}
+
+/** Platform-wide actions (releases, managing resellers) are admin-only. */
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "admins only" });
+  next();
+}
+
+const isAdmin = (req) => req.user?.role === "admin";
+
+/**
+ * THE isolation rule, in one place: an admin sees everything, a reseller sees only rows stamped
+ * with their id. Every device read and write goes through one of these two helpers, so there is no
+ * route where forgetting a filter silently exposes another client's boxes.
+ *
+ * A self-managed box (see isSelfManaged below) is never claimed by anyone — there is no dashboard
+ * "activate" step for it, so its reseller_id stays null and only an admin ever sees it. That is a
+ * property of the self-managed feature itself (it exists precisely to need NO dashboard action),
+ * not a gap introduced here.
+ */
+function deviceSelect(req, columns = "*", opts = undefined) {
+  const q = supabase.from("devices").select(columns, opts);
+  return isAdmin(req) ? q : q.eq("reseller_id", req.user.sub);
+}
+
+function deviceUpdate(req, patch) {
+  const q = supabase.from("devices").update(patch);
+  return isAdmin(req) ? q : q.eq("reseller_id", req.user.sub);
+}
+
+// ---- login throttling: a shared in-memory counter, enough to stop online guessing ----
+const loginAttempts = new Map();
+const LOGIN_MAX = 8;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+
+function loginBlocked(key) {
+  const rec = loginAttempts.get(key);
+  if (!rec) return false;
+  if (Date.now() - rec.first > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(key);
+    return false;
+  }
+  return rec.count >= LOGIN_MAX;
+}
+
+function noteLoginFailure(key) {
+  const rec = loginAttempts.get(key);
+  if (!rec || Date.now() - rec.first > LOGIN_WINDOW_MS) {
+    loginAttempts.set(key, { count: 1, first: Date.now() });
+  } else {
+    rec.count += 1;
+  }
+}
+
+/**
+ * Seeds the FIRST admin from ADMIN_EMAIL/ADMIN_PASSWORD when the resellers table is empty, so a
+ * fresh deploy is reachable. Once any account exists this does nothing — the env vars stop being
+ * credentials and the table is the only source of truth. On the LIVE deploy this seeds the exact
+ * admin@apnatv.com / apnatv2026 pair the old static-secret login used, so the existing admin's
+ * credentials keep working unchanged even though the mechanism underneath is now real accounts.
+ */
+async function bootstrapAdmin() {
+  const { count, error } = await supabase
+    .from(RESELLERS_TABLE).select("id", { count: "exact", head: true });
+  if (error) {
+    console.error(`Cannot read ${RESELLERS_TABLE}: ${error.message}. Run supabase/schema.sql.`);
+    return;
+  }
+  if ((count ?? 0) > 0) return;
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    console.warn("No accounts yet. Set ADMIN_EMAIL + ADMIN_PASSWORD once to seed the first admin.");
+    return;
+  }
+  const { error: insErr } = await supabase.from(RESELLERS_TABLE).insert({
+    email: ADMIN_EMAIL,
+    password_hash: hashPassword(ADMIN_PASSWORD),
+    name: "Administrator",
+    role: "admin",
+  });
+  if (insErr) console.error(`Could not seed admin: ${insErr.message}`);
+  else console.log(`Seeded first admin: ${ADMIN_EMAIL}`);
 }
 
 // ============================================================
@@ -265,21 +427,117 @@ app.get("/setup/:code", (req, res) => {
 // ADMIN (dashboard-facing) endpoints — all behind requireAuth
 // ============================================================
 
-// POST /api/admin/login  { email, password } -> { token }
-app.post("/api/admin/login", (req, res) => {
+// POST /api/admin/login  { email, password } -> { token, email, role, name }
+app.post("/api/admin/login", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
-  if (email === ADMIN_EMAIL.toLowerCase() && password === ADMIN_PASSWORD) {
-    return res.json({ token: AUTH_SECRET, email: ADMIN_EMAIL });
+  const throttleKey = `${req.ip}|${email}`;
+  if (loginBlocked(throttleKey)) {
+    return res.status(429).json({ error: "Too many attempts. Try again in a few minutes." });
   }
-  res.status(401).json({ error: "Invalid email or password" });
+
+  const { data: user } = await supabase
+    .from(RESELLERS_TABLE).select("id, email, name, role, active, password_hash")
+    .ilike("email", email).maybeSingle();
+
+  // One message for every failure — telling them the email exists is a free hint to an attacker.
+  if (!user || !user.active || !verifyPassword(password, user.password_hash)) {
+    noteLoginFailure(throttleKey);
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
+  loginAttempts.delete(throttleKey);
+
+  const token = signToken({
+    sub: user.id,
+    email: user.email,
+    role: user.role,
+    exp: Date.now() + SESSION_HOURS * 3600 * 1000,
+  });
+  res.json({ token, email: user.email, role: user.role, name: user.name });
 });
 
+/** Who am I — lets the dashboard show the signed-in account and hide admin-only pages. */
+app.get("/api/admin/me", requireAuth, (req, res) => {
+  res.json({ email: req.user.email, role: req.user.role, id: req.user.sub });
+});
+
+// ---- resellers (admin only): this is how a NEW client gets an account ----
+app.get("/api/admin/resellers", requireAuth, requireAdmin, async (_req, res) => {
+  const { data } = await supabase.from(RESELLERS_TABLE)
+    .select("id, email, name, role, active, created_at")
+    .order("created_at", { ascending: false });
+  res.json({ resellers: data ?? [] });
+});
+
+app.post("/api/admin/resellers", requireAuth, requireAdmin, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const name = String(req.body?.name || "").trim() || null;
+  const role = req.body?.role === "admin" ? "admin" : "reseller";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .insert({ email, password_hash: hashPassword(password), name, role });
+  if (error) {
+    const dup = /duplicate|unique/i.test(error.message);
+    return res.status(dup ? 409 : 500).json({ error: dup ? "That email already exists" : error.message });
+  }
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/resellers/:id/active", requireAuth, requireAdmin, async (req, res) => {
+  if (req.params.id === req.user.sub) {
+    return res.status(400).json({ error: "You cannot disable your own account" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .update({ active: !!req.body?.active }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/resellers/:id/password", requireAuth, requireAdmin, async (req, res) => {
+  const password = String(req.body?.password || "");
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .update({ password_hash: hashPassword(password) }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// Buckets a set of ISO timestamps into one count per calendar day, oldest first, always `days`
+// long even when a day had zero activity — a chart with gaps where days silently disappear reads
+// as broken, not as "nothing happened that day".
+function dailyBuckets(isoDates, days = 14) {
+  const buckets = new Map();
+  const today = new Date();
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    buckets.set(d.toISOString().slice(0, 10), 0);
+  }
+  for (const iso of isoDates) {
+    const key = String(iso || "").slice(0, 10);
+    if (buckets.has(key)) buckets.set(key, buckets.get(key) + 1);
+  }
+  return [...buckets.entries()].map(([date, value]) => ({
+    label: new Date(date).toLocaleDateString(undefined, { day: "numeric", month: "short" }),
+    value,
+  }));
+}
+
 // GET /api/admin/overview -> stats
-app.get("/api/admin/overview", requireAuth, async (_req, res) => {
+app.get("/api/admin/overview", requireAuth, async (req, res) => {
   const since5 = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  const head = (mod) => mod(supabase.from("devices").select("*", { count: "exact", head: true }));
-  const [total, activated, pending, revoked, online, releases, latest, recent, versions] =
+  const since14d = new Date(Date.now() - 14 * 24 * 3600 * 1000).toISOString();
+  // Every count runs through deviceSelect, so a reseller's dashboard totals cover only their boxes.
+  const head = (mod) => mod(deviceSelect(req, "*", { count: "exact", head: true }));
+  const [total, activated, pending, revoked, online, releases, latest, recent, versions, newDevices] =
     await Promise.all([
       head((q) => q),
       head((q) => q.eq("status", "activated")),
@@ -289,20 +547,23 @@ app.get("/api/admin/overview", requireAuth, async (_req, res) => {
       supabase.from("app_versions").select("*", { count: "exact", head: true }),
       supabase.from("app_versions").select("version_code, version_name, force_update")
         .eq("is_published", true).order("version_code", { ascending: false }).limit(1).maybeSingle(),
-      supabase.from("devices").select("device_id, status, app_version, server_url, last_seen, created_at")
+      deviceSelect(req, "device_id, status, app_version, server_url, last_seen, created_at")
         .order("created_at", { ascending: false }).limit(8),
       supabase.from("app_versions").select("version_code, version_name").order("version_code", { ascending: false }),
+      // Just the timestamps, for the 14-day trend chart — bucketed in JS below rather than a SQL
+      // GROUP BY, since a reseller's own filter (deviceSelect) has to apply to it too.
+      deviceSelect(req, "created_at").gte("created_at", since14d),
     ]);
 
   const latestCode = latest.data?.version_code ?? 0;
   let outdated = 0;
   if (latestCode > 0) {
-    const r = await supabase.from("devices").select("*", { count: "exact", head: true }).lt("app_version", latestCode);
+    const r = await deviceSelect(req, "*", { count: "exact", head: true }).lt("app_version", latestCode);
     outdated = r.count ?? 0;
   }
   const perVersion = await Promise.all(
     (versions.data ?? []).map(async (v) => {
-      const r = await supabase.from("devices").select("*", { count: "exact", head: true }).eq("app_version", v.version_code);
+      const r = await deviceSelect(req, "*", { count: "exact", head: true }).eq("app_version", v.version_code);
       return { ...v, count: r.count ?? 0 };
     })
   );
@@ -318,16 +579,19 @@ app.get("/api/admin/overview", requireAuth, async (_req, res) => {
     latest: latest.data ?? null,
     recent: recent.data ?? [],
     perVersion,
+    daily: dailyBuckets((newDevices.data ?? []).map((d) => d.created_at)),
   });
 });
 
 // ---- versions ----
+// The release feed is not per-reseller — everyone reads the same list (they need to know what
+// their boxes will update to), but only an admin can publish or delete a build.
 app.get("/api/admin/versions", requireAuth, async (_req, res) => {
   const { data } = await supabase.from("app_versions").select("*").order("version_code", { ascending: false });
   res.json({ versions: data ?? [] });
 });
 
-app.post("/api/admin/versions", requireAuth, async (req, res) => {
+app.post("/api/admin/versions", requireAuth, requireAdmin, async (req, res) => {
   const b = req.body || {};
   const { error } = await supabase.from("app_versions").insert({
     version_code: Number(b.version_code),
@@ -341,19 +605,19 @@ app.post("/api/admin/versions", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/admin/versions/:id/publish", requireAuth, async (req, res) => {
+app.post("/api/admin/versions/:id/publish", requireAuth, requireAdmin, async (req, res) => {
   await supabase.from("app_versions").update({ is_published: !!req.body?.publish }).eq("id", req.params.id);
   res.json({ ok: true });
 });
 
-app.delete("/api/admin/versions/:id", requireAuth, async (req, res) => {
+app.delete("/api/admin/versions/:id", requireAuth, requireAdmin, async (req, res) => {
   await supabase.from("app_versions").delete().eq("id", req.params.id);
   res.json({ ok: true });
 });
 
 // ---- devices ----
-app.get("/api/admin/devices", requireAuth, async (_req, res) => {
-  const { data } = await supabase.from("devices").select("*").order("created_at", { ascending: false });
+app.get("/api/admin/devices", requireAuth, async (req, res) => {
+  const { data } = await deviceSelect(req, "*").order("created_at", { ascending: false });
   res.json({ devices: data ?? [] });
 });
 
@@ -362,12 +626,24 @@ app.get("/api/admin/devices", requireAuth, async (_req, res) => {
 app.post("/api/admin/devices/:id/activate", requireAuth, async (req, res) => {
   const customer_name = String(req.body?.customer_name || "").trim() || null;
   const payment_status = String(req.body?.payment_status || "paid").trim();
-  const { error } = await supabase.from("devices").update({
+  const patch = {
     customer_name,
     payment_status,
     status: "activated",
     activated_at: new Date().toISOString(),
-  }).eq("id", req.params.id);
+  };
+
+  // Activating CLAIMS the box for whoever did it, which is what stops one client's devices ever
+  // appearing in another's dashboard. An unclaimed box is claimable; someone else's is not.
+  const { data: row } = await supabase.from("devices")
+    .select("id, reseller_id").eq("id", req.params.id).maybeSingle();
+  if (!row) return res.status(404).json({ error: "No such device" });
+  if (!isAdmin(req) && row.reseller_id && row.reseller_id !== req.user.sub) {
+    return res.status(403).json({ error: "That device belongs to another account" });
+  }
+  if (!row.reseller_id) patch.reseller_id = isAdmin(req) ? (req.body?.reseller_id ?? null) : req.user.sub;
+
+  const { error } = await supabase.from("devices").update(patch).eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
@@ -378,22 +654,30 @@ app.post("/api/admin/devices/:id/payment", requireAuth, async (req, res) => {
   if (!["paid", "unpaid", "expired"].includes(payment_status)) {
     return res.status(400).json({ error: "payment_status must be paid | unpaid | expired" });
   }
-  const { error } = await supabase.from("devices")
-    .update({ payment_status }).eq("id", req.params.id);
+  const { error, count } = await deviceUpdate(req, { payment_status })
+    .eq("id", req.params.id).select("id", { count: "exact" });
   if (error) return res.status(500).json({ error: error.message });
+  if (!count) return res.status(404).json({ error: "No such device" });
   res.json({ ok: true });
 });
 
 app.post("/api/admin/devices/:id/revoke", requireAuth, async (req, res) => {
-  await supabase.from("devices").update({ status: "revoked" }).eq("id", req.params.id);
+  const { count } = await deviceUpdate(req, { status: "revoked" })
+    .eq("id", req.params.id).select("id", { count: "exact" });
+  if (!count) return res.status(404).json({ error: "No such device" });
   res.json({ ok: true });
 });
 
 // Activate by pairing code (the QR-scanned flow)
 app.get("/api/admin/by-code/:code", requireAuth, async (req, res) => {
   const { data } = await supabase.from("devices")
-    .select("id, device_id, status, server_url, mac, pairing_code, customer_name, payment_status")
+    .select("id, device_id, status, server_url, mac, pairing_code, customer_name, payment_status, reseller_id")
     .eq("pairing_code", String(req.params.code).trim().toUpperCase()).maybeSingle();
+  // A pairing code is how an UNCLAIMED box gets adopted, so a lookup can find one that isn't yours
+  // yet — but never one another reseller already owns.
+  if (data && !isAdmin(req) && data.reseller_id && data.reseller_id !== req.user.sub) {
+    return res.json({ device: null });
+  }
   res.json({ device: data ?? null });
 });
 
@@ -404,13 +688,27 @@ app.post("/api/admin/activate", requireAuth, async (req, res) => {
   const customer_name = String(req.body?.customer_name || "").trim() || null;
   const payment_status = String(req.body?.payment_status || "paid").trim();
   if (!code) return res.status(400).json({ error: "code required" });
-  const { data, error } = await supabase.from("devices").update({
+  const patch = {
     customer_name, payment_status,
     status: "activated", activated_at: new Date().toISOString(),
-  }).eq("pairing_code", code).select("id").maybeSingle();
+  };
+
+  const { data: row } = await supabase.from("devices")
+    .select("id, reseller_id").eq("pairing_code", code).maybeSingle();
+  if (!row) return res.status(404).json({ error: "No device found for that code" });
+  if (!isAdmin(req) && row.reseller_id && row.reseller_id !== req.user.sub) {
+    return res.status(403).json({ error: "That device belongs to another account" });
+  }
+  // Same claim-on-activate rule as the by-id route above.
+  if (!row.reseller_id && !isAdmin(req)) patch.reseller_id = req.user.sub;
+
+  const { error } = await supabase.from("devices").update(patch).eq("id", row.id);
   if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: "No device found for that code" });
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => console.log(`Apna TV backend listening on :${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Apna TV backend listening on :${PORT}`);
+  console.log(`  CORS ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "any (dev)"}`);
+  await bootstrapAdmin();
+});
