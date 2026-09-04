@@ -11,7 +11,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABAS
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // First-run bootstrap admin. Used ONCE, to seed the resellers table on an empty database; after
 // that every sign-in is checked against that table. Not a standing back door.
+<<<<<<< HEAD
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "admin@apnatv.com").trim().toLowerCase();
+=======
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 
 // Signs dashboard session tokens. There is deliberately NO default: a shipped fallback secret is a
@@ -25,12 +29,50 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map((o) => o.trim()).filter(Boolean);
 // Where the QR-scanned activation page lives (the dashboard). Used to build the QR link.
 const DASHBOARD_URL = process.env.DASHBOARD_URL || "";
+<<<<<<< HEAD
 // The ONLY managed portal every box connects to by default — hardcoded here and in the app
 // (RemoteConfig). star.homeip.net is correct: the app's RedirectFixInterceptor resolves it to the
 // live backend. A box can instead report its OWN portal — see isSelfManaged below.
 const STATIC_PORTAL_URL = process.env.STATIC_PORTAL_URL || "http://star.homeip.net";
 const RESELLERS_TABLE = "resellers";
 
+=======
+
+// The servers 10K Ultra ships with. Kept in ONE place: the dashboard fetches this list for its
+// server picker and the app hardcodes the same three (RemoteConfig.PORTALS).
+//
+// All three were verified against the Stalker API (/stalker_portal/server/load.php →
+// action=handshake returns a token). NOTE on Mega 4K: mega4k.cc itself serves NO Stalker API
+// (404) — it root-redirects to steel4k.cc, which does, and the app probes paths on the host it
+// is given without hopping hosts. So the working host is pinned here.
+const PORTALS = [
+  { label: "A1 TV", url: "http://tv.a1tv.ac" },
+  { label: "Elite 4K", url: "http://portal.elite4k.co" },
+  { label: "Mega 4K", url: "http://steel4k.cc" },
+];
+const DEFAULT_PORTAL_URL = process.env.DEFAULT_PORTAL_URL || PORTALS[0].url;
+
+// ---- Product isolation -------------------------------------------------------------------
+// 10K Ultra and any other product MUST NOT share a version feed: `/api/version/check` only
+// compares version codes, so one product's release makes the other's boxes show a bogus
+// "Update Required" (and a forced one blocks the app entirely).
+//
+// Two knobs, so this works whether or not 10K Ultra has its own Supabase yet:
+//  - DEVICES_TABLE / VERSIONS_TABLE: point at product-specific tables when they exist.
+//  - OTA_ENABLED=false: serve no updates at all. Correct while 10K Ultra has published no
+//    releases of its own, and the safe default when the database is shared with another app.
+const DEVICES_TABLE = process.env.DEVICES_TABLE || "devices";
+const VERSIONS_TABLE = process.env.VERSIONS_TABLE || "app_versions";
+const RESELLERS_TABLE = process.env.RESELLERS_TABLE || "tenkultra_resellers";
+const OTA_ENABLED = String(process.env.OTA_ENABLED ?? "true").toLowerCase() !== "false";
+
+/** Accepts only a plain http(s) URL — keeps a typo/injection out of the devices table. */
+function cleanPortalUrl(value) {
+  const v = String(value || "").trim().replace(/\/+$/, "");
+  return /^https?:\/\/[^\s]+$/i.test(v) ? v : null;
+}
+
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
 // Fail fast rather than boot into an insecure state that looks fine until it is exploited.
 const fatal = [];
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
@@ -137,6 +179,7 @@ const isAdmin = (req) => req.user?.role === "admin";
  * THE isolation rule, in one place: an admin sees everything, a reseller sees only rows stamped
  * with their id. Every device read and write goes through one of these two helpers, so there is no
  * route where forgetting a filter silently exposes another client's boxes.
+<<<<<<< HEAD
  *
  * A self-managed box (see isSelfManaged below) is never claimed by anyone — there is no dashboard
  * "activate" step for it, so its reseller_id stays null and only an admin ever sees it. That is a
@@ -145,11 +188,20 @@ const isAdmin = (req) => req.user?.role === "admin";
  */
 function deviceSelect(req, columns = "*", opts = undefined) {
   const q = supabase.from("devices").select(columns, opts);
+=======
+ */
+function deviceSelect(req, columns = "*", opts = undefined) {
+  const q = supabase.from(DEVICES_TABLE).select(columns, opts);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   return isAdmin(req) ? q : q.eq("reseller_id", req.user.sub);
 }
 
 function deviceUpdate(req, patch) {
+<<<<<<< HEAD
   const q = supabase.from("devices").update(patch);
+=======
+  const q = supabase.from(DEVICES_TABLE).update(patch);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   return isAdmin(req) ? q : q.eq("reseller_id", req.user.sub);
 }
 
@@ -180,15 +232,23 @@ function noteLoginFailure(key) {
 /**
  * Seeds the FIRST admin from ADMIN_EMAIL/ADMIN_PASSWORD when the resellers table is empty, so a
  * fresh deploy is reachable. Once any account exists this does nothing — the env vars stop being
+<<<<<<< HEAD
  * credentials and the table is the only source of truth. On the LIVE deploy this seeds the exact
  * admin@apnatv.com / apnatv2026 pair the old static-secret login used, so the existing admin's
  * credentials keep working unchanged even though the mechanism underneath is now real accounts.
+=======
+ * credentials and the table is the only source of truth.
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
  */
 async function bootstrapAdmin() {
   const { count, error } = await supabase
     .from(RESELLERS_TABLE).select("id", { count: "exact", head: true });
   if (error) {
+<<<<<<< HEAD
     console.error(`Cannot read ${RESELLERS_TABLE}: ${error.message}. Run supabase/schema.sql.`);
+=======
+    console.error(`Cannot read ${RESELLERS_TABLE}: ${error.message}. Run supabase/schema-10kultra.sql.`);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     return;
   }
   if ((count ?? 0) > 0) return;
@@ -211,8 +271,11 @@ async function bootstrapAdmin() {
 // ============================================================
 
 // Health check
-app.get("/", (_req, res) => res.json({ ok: true, service: "apnatv-backend" }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "10kultra-backend" }));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// The built-in server list — the dashboard's picker reads this so the URLs live in ONE place.
+app.get("/api/portals", (_req, res) => res.json({ portals: PORTALS, default: DEFAULT_PORTAL_URL }));
 
 // POST /api/device/register  { device_id, mac?, model?, sig_sha256?, app_version? }
 // The box auto-registers on boot, sending its own MAC. We store the MAC + the static
@@ -223,8 +286,8 @@ app.post("/api/device/register", async (req, res) => {
   if (!device_id) return res.status(400).json({ error: "device_id required" });
 
   const { data: existing } = await supabase
-    .from("devices")
-    .select("id, status, pairing_code, mac")
+    .from(DEVICES_TABLE)
+    .select("id, status, pairing_code, mac, server_url")
     .eq("device_id", device_id)
     .maybeSingle();
 
@@ -232,29 +295,24 @@ app.post("/api/device/register", async (req, res) => {
     return res.json({ status: "activated", pairing_code: existing.pairing_code, mac: existing.mac });
   }
 
-  // Self-managed: the box is on a RESELLER's OWN portal (a non-star server_url it sent). Such a box
-  // is NOT under our activation/payment/revoke control — we just RECORD it so the dashboard can SHOW
-  // it. Only the default star.homeip.net portal goes through the pairing-code activation flow.
-  const norm = (s) => String(s || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
-  const server_url_in = String(req.body?.server_url || "").trim();
-  const isSelfManaged = server_url_in && norm(server_url_in) !== norm(STATIC_PORTAL_URL);
-
+  // MANAGED BUILD: every box is licensed here, so a fresh box is always "pending" until an admin
+  // activates it. The URL the box reports is only a fallback for a brand-new row — an admin-assigned
+  // server_url is never overwritten by whatever the box happens to be pointed at.
   const pairing_code = existing?.pairing_code ?? genPairingCode();
+  const reported = cleanPortalUrl(req.body?.server_url);
   const row = {
     device_id,
     pairing_code,
-    status: isSelfManaged ? "self_managed" : (existing?.status ?? "pending"),
-    server_url: isSelfManaged ? server_url_in : STATIC_PORTAL_URL,
+    status: existing?.status ?? "pending",
+    server_url: existing?.server_url ?? reported ?? DEFAULT_PORTAL_URL,
     mac: mac || existing?.mac || null,    // auto-set from the device's own MAC
     model: req.body?.model ?? null,
     sig_sha256: req.body?.sig_sha256 ?? null,
     app_version: req.body?.app_version ?? null,
     last_seen: new Date().toISOString(),
   };
-  // A self-managed box is never "unpaid" in our system — mark it paid so nothing ever locks it.
-  if (isSelfManaged) row.payment_status = "paid";
 
-  const { error } = await supabase.from("devices").upsert(row, { onConflict: "device_id" });
+  const { error } = await supabase.from(DEVICES_TABLE).upsert(row, { onConflict: "device_id" });
   if (error) return res.status(500).json({ error: error.message });
   res.json({ status: row.status, pairing_code, mac: row.mac });
 });
@@ -265,14 +323,14 @@ app.get("/api/device/config", async (req, res) => {
   if (!device_id) return res.status(400).json({ error: "device_id required" });
 
   const { data } = await supabase
-    .from("devices")
+    .from(DEVICES_TABLE)
     .select("status, server_url, mac, payment_status, customer_name")
     .eq("device_id", device_id)
     .maybeSingle();
   if (!data) return res.status(404).json({ status: "unknown" });
 
   await supabase
-    .from("devices")
+    .from(DEVICES_TABLE)
     .update({ last_seen: new Date().toISOString() })
     .eq("device_id", device_id);
 
@@ -296,12 +354,15 @@ app.get("/api/version/check", async (req, res) => {
   const device_id = String(req.query.device_id || "").trim();
   if (device_id) {
     await supabase
-      .from("devices")
+      .from(DEVICES_TABLE)
       .update({ app_version: current, last_seen: new Date().toISOString() })
       .eq("device_id", device_id);
   }
+  // No 10K Ultra release feed configured → never offer an update (see OTA_ENABLED above).
+  if (!OTA_ENABLED) return res.json({ update_available: false });
+
   const { data: latest } = await supabase
-    .from("app_versions")
+    .from(VERSIONS_TABLE)
     .select("version_code, version_name, apk_url, apk_size, changelog, force_update")
     .eq("is_published", true)
     .order("version_code", { ascending: false })
@@ -454,6 +515,63 @@ app.post("/api/admin/login", async (req, res) => {
     exp: Date.now() + SESSION_HOURS * 3600 * 1000,
   });
   res.json({ token, email: user.email, role: user.role, name: user.name });
+<<<<<<< HEAD
+=======
+});
+
+/** Who am I — lets the dashboard show the signed-in account and hide admin-only pages. */
+app.get("/api/admin/me", requireAuth, (req, res) => {
+  res.json({ email: req.user.email, role: req.user.role, id: req.user.sub });
+});
+
+// ---- resellers (admin only): this is how a NEW client gets an account ----
+app.get("/api/admin/resellers", requireAuth, requireAdmin, async (_req, res) => {
+  const { data } = await supabase.from(RESELLERS_TABLE)
+    .select("id, email, name, role, active, created_at")
+    .order("created_at", { ascending: false });
+  res.json({ resellers: data ?? [] });
+});
+
+app.post("/api/admin/resellers", requireAuth, requireAdmin, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const name = String(req.body?.name || "").trim() || null;
+  const role = req.body?.role === "admin" ? "admin" : "reseller";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .insert({ email, password_hash: hashPassword(password), name, role });
+  if (error) {
+    const dup = /duplicate|unique/i.test(error.message);
+    return res.status(dup ? 409 : 500).json({ error: dup ? "That email already exists" : error.message });
+  }
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/resellers/:id/active", requireAuth, requireAdmin, async (req, res) => {
+  if (req.params.id === req.user.sub) {
+    return res.status(400).json({ error: "You cannot disable your own account" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .update({ active: !!req.body?.active }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/resellers/:id/password", requireAuth, requireAdmin, async (req, res) => {
+  const password = String(req.body?.password || "");
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+  const { error } = await supabase.from(RESELLERS_TABLE)
+    .update({ password_hash: hashPassword(password) }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
 });
 
 /** Who am I — lets the dashboard show the signed-in account and hide admin-only pages. */
@@ -534,25 +652,35 @@ function dailyBuckets(isoDates, days = 14) {
 // GET /api/admin/overview -> stats
 app.get("/api/admin/overview", requireAuth, async (req, res) => {
   const since5 = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+<<<<<<< HEAD
   const since14d = new Date(Date.now() - 14 * 24 * 3600 * 1000).toISOString();
   // Every count runs through deviceSelect, so a reseller's dashboard totals cover only their boxes.
   const head = (mod) => mod(deviceSelect(req, "*", { count: "exact", head: true }));
   const [total, activated, pending, revoked, online, releases, latest, recent, versions, newDevices] =
+=======
+  // Every count runs through deviceSelect, so a reseller's dashboard totals cover only their boxes.
+  const head = (mod) => mod(deviceSelect(req, "*", { count: "exact", head: true }));
+  const [total, activated, pending, revoked, online, releases, latest, recent, versions] =
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     await Promise.all([
       head((q) => q),
       head((q) => q.eq("status", "activated")),
       head((q) => q.eq("status", "pending")),
       head((q) => q.eq("status", "revoked")),
       head((q) => q.gte("last_seen", since5)),
-      supabase.from("app_versions").select("*", { count: "exact", head: true }),
-      supabase.from("app_versions").select("version_code, version_name, force_update")
+      supabase.from(VERSIONS_TABLE).select("*", { count: "exact", head: true }),
+      supabase.from(VERSIONS_TABLE).select("version_code, version_name, force_update")
         .eq("is_published", true).order("version_code", { ascending: false }).limit(1).maybeSingle(),
       deviceSelect(req, "device_id, status, app_version, server_url, last_seen, created_at")
         .order("created_at", { ascending: false }).limit(8),
+<<<<<<< HEAD
       supabase.from("app_versions").select("version_code, version_name").order("version_code", { ascending: false }),
       // Just the timestamps, for the 14-day trend chart — bucketed in JS below rather than a SQL
       // GROUP BY, since a reseller's own filter (deviceSelect) has to apply to it too.
       deviceSelect(req, "created_at").gte("created_at", since14d),
+=======
+      supabase.from(VERSIONS_TABLE).select("version_code, version_name").order("version_code", { ascending: false }),
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     ]);
 
   const latestCode = latest.data?.version_code ?? 0;
@@ -584,16 +712,21 @@ app.get("/api/admin/overview", requireAuth, async (req, res) => {
 });
 
 // ---- versions ----
+<<<<<<< HEAD
 // The release feed is not per-reseller — everyone reads the same list (they need to know what
 // their boxes will update to), but only an admin can publish or delete a build.
+=======
+// The release feed is per-PRODUCT, not per-reseller: everyone reads the same list (they need to
+// know what their boxes will update to), but only an admin can publish or delete a build.
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
 app.get("/api/admin/versions", requireAuth, async (_req, res) => {
-  const { data } = await supabase.from("app_versions").select("*").order("version_code", { ascending: false });
+  const { data } = await supabase.from(VERSIONS_TABLE).select("*").order("version_code", { ascending: false });
   res.json({ versions: data ?? [] });
 });
 
 app.post("/api/admin/versions", requireAuth, requireAdmin, async (req, res) => {
   const b = req.body || {};
-  const { error } = await supabase.from("app_versions").insert({
+  const { error } = await supabase.from(VERSIONS_TABLE).insert({
     version_code: Number(b.version_code),
     version_name: String(b.version_name || "").trim(),
     apk_url: String(b.apk_url || "").trim(),
@@ -606,12 +739,20 @@ app.post("/api/admin/versions", requireAuth, requireAdmin, async (req, res) => {
 });
 
 app.post("/api/admin/versions/:id/publish", requireAuth, requireAdmin, async (req, res) => {
+<<<<<<< HEAD
   await supabase.from("app_versions").update({ is_published: !!req.body?.publish }).eq("id", req.params.id);
+=======
+  await supabase.from(VERSIONS_TABLE).update({ is_published: !!req.body?.publish }).eq("id", req.params.id);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   res.json({ ok: true });
 });
 
 app.delete("/api/admin/versions/:id", requireAuth, requireAdmin, async (req, res) => {
+<<<<<<< HEAD
   await supabase.from("app_versions").delete().eq("id", req.params.id);
+=======
+  await supabase.from(VERSIONS_TABLE).delete().eq("id", req.params.id);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   res.json({ ok: true });
 });
 
@@ -626,16 +767,29 @@ app.get("/api/admin/devices", requireAuth, async (req, res) => {
 app.post("/api/admin/devices/:id/activate", requireAuth, async (req, res) => {
   const customer_name = String(req.body?.customer_name || "").trim() || null;
   const payment_status = String(req.body?.payment_status || "paid").trim();
+<<<<<<< HEAD
+=======
+  const server_url = cleanPortalUrl(req.body?.server_url);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   const patch = {
     customer_name,
     payment_status,
     status: "activated",
     activated_at: new Date().toISOString(),
   };
+<<<<<<< HEAD
 
   // Activating CLAIMS the box for whoever did it, which is what stops one client's devices ever
   // appearing in another's dashboard. An unclaimed box is claimable; someone else's is not.
   const { data: row } = await supabase.from("devices")
+=======
+  // Only overwrite the portal when the admin actually picked one — otherwise keep what's on file.
+  if (server_url) patch.server_url = server_url;
+
+  // Activating CLAIMS the box for whoever did it, which is what stops one client's devices ever
+  // appearing in another's dashboard. An unclaimed box is claimable; someone else's is not.
+  const { data: row } = await supabase.from(DEVICES_TABLE)
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     .select("id, reseller_id").eq("id", req.params.id).maybeSingle();
   if (!row) return res.status(404).json({ error: "No such device" });
   if (!isAdmin(req) && row.reseller_id && row.reseller_id !== req.user.sub) {
@@ -643,9 +797,25 @@ app.post("/api/admin/devices/:id/activate", requireAuth, async (req, res) => {
   }
   if (!row.reseller_id) patch.reseller_id = isAdmin(req) ? (req.body?.reseller_id ?? null) : req.user.sub;
 
+<<<<<<< HEAD
   const { error } = await supabase.from("devices").update(patch).eq("id", req.params.id);
+=======
+  const { error } = await supabase.from(DEVICES_TABLE).update(patch).eq("id", req.params.id);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
+});
+
+// Re-point an ALREADY-ACTIVATED box at a different server. The box picks this up on its next
+// config poll / boot, clears its cached endpoint and reconnects — no visit to the customer.
+app.post("/api/admin/devices/:id/server", requireAuth, async (req, res) => {
+  const server_url = cleanPortalUrl(req.body?.server_url);
+  if (!server_url) return res.status(400).json({ error: "a valid http(s) server_url is required" });
+  const { error, count } = await deviceUpdate(req, { server_url })
+    .eq("id", req.params.id).select("id", { count: "exact" });
+  if (error) return res.status(500).json({ error: error.message });
+  if (!count) return res.status(404).json({ error: "No such device" });
+  res.json({ ok: true, server_url });
 });
 
 // Toggle payment (paid / unpaid / expired). Unpaid/expired → app locks on next config poll.
@@ -670,7 +840,11 @@ app.post("/api/admin/devices/:id/revoke", requireAuth, async (req, res) => {
 
 // Activate by pairing code (the QR-scanned flow)
 app.get("/api/admin/by-code/:code", requireAuth, async (req, res) => {
+<<<<<<< HEAD
   const { data } = await supabase.from("devices")
+=======
+  const { data } = await supabase.from(DEVICES_TABLE)
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     .select("id, device_id, status, server_url, mac, pairing_code, customer_name, payment_status, reseller_id")
     .eq("pairing_code", String(req.params.code).trim().toUpperCase()).maybeSingle();
   // A pairing code is how an UNCLAIMED box gets adopted, so a lookup can find one that isn't yours
@@ -687,13 +861,21 @@ app.post("/api/admin/activate", requireAuth, async (req, res) => {
   const code = String(req.body?.code || "").trim().toUpperCase();
   const customer_name = String(req.body?.customer_name || "").trim() || null;
   const payment_status = String(req.body?.payment_status || "paid").trim();
+  const server_url = cleanPortalUrl(req.body?.server_url);
   if (!code) return res.status(400).json({ error: "code required" });
   const patch = {
     customer_name, payment_status,
     status: "activated", activated_at: new Date().toISOString(),
   };
+<<<<<<< HEAD
 
   const { data: row } = await supabase.from("devices")
+=======
+  // Only overwrite the portal when the admin actually picked one — otherwise keep what's on file.
+  if (server_url) patch.server_url = server_url;
+
+  const { data: row } = await supabase.from(DEVICES_TABLE)
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
     .select("id, reseller_id").eq("pairing_code", code).maybeSingle();
   if (!row) return res.status(404).json({ error: "No device found for that code" });
   if (!isAdmin(req) && row.reseller_id && row.reseller_id !== req.user.sub) {
@@ -702,13 +884,23 @@ app.post("/api/admin/activate", requireAuth, async (req, res) => {
   // Same claim-on-activate rule as the by-id route above.
   if (!row.reseller_id && !isAdmin(req)) patch.reseller_id = req.user.sub;
 
+<<<<<<< HEAD
   const { error } = await supabase.from("devices").update(patch).eq("id", row.id);
+=======
+  const { error } = await supabase.from(DEVICES_TABLE).update(patch).eq("id", row.id);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
 app.listen(PORT, async () => {
+<<<<<<< HEAD
   console.log(`Apna TV backend listening on :${PORT}`);
   console.log(`  CORS ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "any (dev)"}`);
+=======
+  console.log(`10K Ultra backend listening on :${PORT}`);
+  console.log(`  devices=${DEVICES_TABLE}  versions=${VERSIONS_TABLE}  resellers=${RESELLERS_TABLE}`);
+  console.log(`  OTA ${OTA_ENABLED ? "enabled" : "disabled"} · CORS ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "any (dev)"}`);
+>>>>>>> 60f86d503a94542cf934db8283e4a875d8b4f318
   await bootstrapAdmin();
 });
