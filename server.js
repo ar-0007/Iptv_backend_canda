@@ -299,10 +299,17 @@ app.get("/api/version/check", async (req, res) => {
   const current = Number(req.query.version_code ?? "0");
   const device_id = String(req.query.device_id || "").trim();
   if (device_id) {
+    // UPSERT, not update: a device that connected via the direct "type portal URL" flow (never
+    // called /api/device/register) used to be invisible here forever — an update() against a
+    // device_id with no matching row silently touches zero rows. Every device checks for updates
+    // on launch regardless of how it connected, so this is the one call guaranteed to eventually
+    // surface it in the dashboard, even with no MAC/portal known yet.
     await supabase
       .from("devices")
-      .update({ app_version: current, last_seen: new Date().toISOString() })
-      .eq("device_id", device_id);
+      .upsert(
+        { device_id, app_version: current, last_seen: new Date().toISOString() },
+        { onConflict: "device_id", ignoreDuplicates: false }
+      );
   }
   const { data: latest } = await supabase
     .from("app_versions")
